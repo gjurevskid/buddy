@@ -28,6 +28,7 @@ const memoryRow = document.getElementById('memoryRow');
 const memoryList = document.getElementById('memoryList');
 const clearMemoryBtn = document.getElementById('clearMemoryBtn');
 const usageSummary = document.getElementById('usageSummary');
+const quitBtn = document.getElementById('quitBtn');
 
 let hasApiKey = false;
 let currentCharacter = 'robot';
@@ -335,6 +336,10 @@ voiceBtn.addEventListener('click', async () => {
 
 closeBtn.addEventListener('click', () => {
   window.buddy.closeChat();
+});
+
+quitBtn.addEventListener('click', () => {
+  window.buddy.quitApp();
 });
 
 // --- Voice input (Web Speech API, built into Chromium) ---

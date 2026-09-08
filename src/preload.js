@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld('buddy', {
 
   toggleChat: () => ipcRenderer.send('toggle-chat'),
   closeChat: () => ipcRenderer.send('close-chat'),
+  quitApp: () => ipcRenderer.send('quit-app'),
 
   petDragStart: () => ipcRenderer.send('pet-drag-start'),
   petDragMove: (dx, dy) => ipcRenderer.send('pet-drag-move', { dx, dy }),

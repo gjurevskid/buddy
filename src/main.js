@@ -901,6 +901,8 @@ ipcMain.on('toggle-chat', () => {
 
 ipcMain.on('close-chat', () => closeChat());
 
+ipcMain.on('quit-app', () => app.quit());
+
 ipcMain.on('pet-drag-start', () => {
   pet.mode = 'dragging';
 });
