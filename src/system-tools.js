@@ -215,6 +215,31 @@ async function getFrontWindowBounds() {
   }
 }
 
+async function getDockBounds() {
+  try {
+    // The final string-building has to happen OUTSIDE the nested "tell
+    // process" block — "&" concatenation inside it gets misdirected as an
+    // Apple Event to the Dock process instead of plain AppleScript string
+    // concat, silently producing garbage like "170, ,, 915, ...".
+    const script = `
+      tell application "System Events"
+        tell process "Dock"
+          set dockList to list 1
+          set {dx, dy} to position of dockList
+          set {dw, dh} to size of dockList
+        end tell
+      end tell
+      return (dx as string) & "," & (dy as string) & "," & (dw as string) & "," & (dh as string)
+    `;
+    const out = await runOsascript(script, 4000);
+    const [x, y, w, h] = out.split(',').map((s) => Number(s.trim()));
+    if (!w || !h) return { dock: null };
+    return { dock: { x, y, width: w, height: h } };
+  } catch {
+    return { dock: null };
+  }
+}
+
 async function getNextCalendarEvent() {
   try {
     // Scoped to a 2-hour lookahead and a hard timeout: Calendar.app's
@@ -291,6 +316,7 @@ module.exports = {
   isWithinHome,
   getActiveApp,
   getFrontWindowBounds,
+  getDockBounds,
   getNextCalendarEvent,
   classifyFileKind
 };

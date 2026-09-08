@@ -1,4 +1,3 @@
-const bubble = document.getElementById('bubble');
 const zzz = document.getElementById('zzz');
 const dropHint = document.getElementById('dropHint');
 const petFlip = document.getElementById('petFlip');
@@ -11,7 +10,6 @@ let currentState = 'idle';
 let currentStage = 'adult';
 let currentEnergy = 80;
 let voiceEnabled = false;
-let bubbleTimer = null;
 
 const MOOD_CLASSES = ['mood-delighted', 'mood-content', 'mood-bored', 'mood-lonely', 'mood-neglected'];
 const STATE_CLASSES = ['state-idle', 'state-walk', 'state-jump', 'state-sleep'];
@@ -30,7 +28,7 @@ function renderCharacter() {
 function applyState(mode) {
   currentState = mode;
   stage.classList.remove(...STATE_CLASSES);
-  const cssState = mode === 'dragging' ? 'idle' : mode;
+  const cssState = mode === 'dragging' || mode === 'perched' ? 'idle' : mode === 'climb' ? 'walk' : mode;
   stage.classList.add(`state-${cssState}`);
   stage.classList.toggle('sleeping', mode === 'sleep');
   zzz.classList.toggle('hidden', mode !== 'sleep');
@@ -42,14 +40,6 @@ function applyMood(mood, moodLabel) {
   stage.classList.remove(...MOOD_CLASSES);
   stage.classList.add(`mood-${moodLabel}`);
   renderCharacter();
-}
-
-function showBubble(text, ms = 8000, { voice = true } = {}) {
-  bubble.textContent = text;
-  bubble.classList.remove('hidden');
-  clearTimeout(bubbleTimer);
-  bubbleTimer = setTimeout(() => bubble.classList.add('hidden'), ms);
-  if (voice && voiceEnabled) speak(text);
 }
 
 function popHeart() {
@@ -97,7 +87,7 @@ let idleLookTimer = null;
 function scheduleIdleLook() {
   clearTimeout(idleLookTimer);
   const next = () => {
-    if (currentState === 'idle') {
+    if (currentState === 'idle' || currentState === 'perched') {
       const sleepyChance = 0.12 + (1 - currentEnergy / 100) * 0.4;
       const roll = Math.random();
       if (roll < sleepyChance) {
@@ -159,14 +149,13 @@ window.buddy.onCharacterChanged((id) => {
   renderCharacter();
 });
 
-window.buddy.onBuddySays(({ text, short }) => {
-  showBubble(text, short ? 2600 : 9000, { voice: !short });
+window.buddy.onSpeakRequest(({ text, voice }) => {
+  if (voice && voiceEnabled) speak(text);
 });
 
-window.buddy.onBuddyEvolved(({ line }) => {
+window.buddy.onBuddyEvolved(() => {
   renderCharacter();
   playEvolution();
-  if (line) showBubble(line, 9000);
 });
 
 async function doPet() {
@@ -236,8 +225,7 @@ appEl.addEventListener('drop', async (e) => {
   if (!filePath) return;
   window.buddy.notifyUserActive();
   popHeart();
-  const result = await window.buddy.feedFile(filePath);
-  if (!result.ok && result.error) showBubble(result.error, 4000, { voice: false });
+  await window.buddy.feedFile(filePath);
 });
 
 init();

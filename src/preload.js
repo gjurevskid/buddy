@@ -38,13 +38,19 @@ contextBridge.exposeInMainWorld('buddy', {
   onCharacterChanged: (callback) => {
     ipcRenderer.on('character-changed', (_evt, id) => callback(id));
   },
-  onBuddySays: (callback) => {
-    ipcRenderer.on('buddy-says', (_evt, payload) => callback(payload));
-  },
   onBuddyEvolved: (callback) => {
     ipcRenderer.on('buddy-evolved', (_evt, payload) => callback(payload));
   },
   onVoiceChanged: (callback) => {
     ipcRenderer.on('voice-changed', (_evt, enabled) => callback(enabled));
+  },
+  onSpeakRequest: (callback) => {
+    ipcRenderer.on('speak-request', (_evt, payload) => callback(payload));
+  },
+  onBubbleText: (callback) => {
+    ipcRenderer.on('bubble-text', (_evt, text) => callback(text));
+  },
+  onBubbleSide: (callback) => {
+    ipcRenderer.on('bubble-side', (_evt, side) => callback(side));
   }
 });

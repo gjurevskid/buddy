@@ -7,6 +7,7 @@ const { getSpecies, randomLine } = require('./reactions');
 
 let petWin;
 let chatWin;
+let bubbleWin;
 let tray;
 let lastUserInteraction = Date.now();
 let proactiveInterval;
@@ -15,11 +16,16 @@ let hungerInterval;
 let awarenessInterval;
 let alertInterval;
 let perchInterval;
+let dragWatchInterval;
+let bubbleHideTimer = null;
 
 // In-memory only (not persisted): which app has been frontmost and since
-// when, and which calendar event we've already announced this run.
+// when, which calendar event we've already announced this run, the last
+// seen frontmost-window bounds (to detect dragging), and what the pet is
+// currently perched on (if anything).
 const focusTracker = { app: null, since: Date.now() };
 let lastAnnouncedEventTitle = null;
+let lastWindowBounds = null;
 
 const PET_W = 220;
 const PET_H = 200;
@@ -33,6 +39,8 @@ const CHAT_MIN_W = 220;
 const CHAT_MIN_H = 260;
 const CHAT_MAX_W = 420;
 const CHAT_MAX_H = 560;
+const BUBBLE_W = 260;
+const BUBBLE_H = 130;
 
 // Tracks the pet window's *current* size, which can differ from PET_W/PET_H
 // once the user drags a resize handle — everything below reads these instead
@@ -76,13 +84,20 @@ const pet = {
   y: 0,
   groundY: 0,
   dir: 1,
-  mode: 'idle', // idle | walk | jump | sleep | dragging
+  mode: 'idle', // idle | walk | jump | sleep | dragging | climb | perched
   modeUntil: 0,
   jumpStart: 0,
   jumpFromMode: 'idle',
   chatOpen: false,
   sentMode: null,
-  sentDir: null
+  sentDir: null,
+  // climb/perched only:
+  climbFrom: null,
+  climbTo: null,
+  climbStart: 0,
+  climbDuration: 0,
+  perchSource: null, // 'window' | 'dock' | 'ground'
+  perchWindowBounds: null
 };
 
 function screenBounds() {
@@ -190,12 +205,34 @@ function petTick() {
     const { width: sw } = screenBounds();
     if (pet.x <= 0 || pet.x >= sw - petSize.w) pet.dir *= -1;
     petWin.setPosition(Math.round(pet.x), Math.round(pet.groundY));
+  } else if (pet.mode === 'climb') {
+    const t = Math.min((now - pet.climbStart) / pet.climbDuration, 1);
+    const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; // easeInOutQuad
+    pet.x = pet.climbFrom.x + (pet.climbTo.x - pet.climbFrom.x) * ease;
+    pet.y = pet.climbFrom.y + (pet.climbTo.y - pet.climbFrom.y) * ease;
+    petWin.setPosition(Math.round(pet.x), Math.round(pet.y));
+    if (t >= 1) {
+      if (pet.perchSource === 'ground') {
+        pet.groundY = pet.y;
+        pet.perchSource = null;
+        pet.mode = 'idle';
+        pet.modeUntil = now + 2000;
+      } else {
+        pet.mode = 'perched';
+        pet.modeUntil = now + 15000 + Math.random() * 15000;
+      }
+    }
   }
 
-  if (now >= pet.modeUntil && pet.mode !== 'jump') {
-    pickNextBehavior();
+  if (now >= pet.modeUntil && pet.mode !== 'jump' && pet.mode !== 'climb') {
+    if (pet.mode === 'perched') {
+      climbDown();
+    } else {
+      pickNextBehavior();
+    }
   }
 
+  if (bubbleWin && bubbleWin.isVisible()) positionBubble();
   sendPetUpdate();
 }
 
@@ -210,31 +247,103 @@ function resetPetPosition() {
   sendPetUpdate(true);
 }
 
-// Lightweight take on Shimeji-style desktop physicality: rather than fully
-// climbing on top of other windows (which needs low-level window-layer
-// APIs), Buddy occasionally ambles over to stand near whatever window is
-// currently in front — using the same tuned walk physics as normal roaming.
-function tryApproachFrontWindow() {
-  if (!petWin || pet.mode !== 'idle' || pet.chatOpen) return;
-  systemTools
-    .getFrontWindowBounds()
-    .then(({ window }) => {
-      if (!window || pet.mode !== 'idle' || pet.chatOpen) return;
-      const targetCenter = window.x + window.width / 2;
-      const targetX = clampX(targetCenter - petSize.w / 2);
-      const distance = Math.abs(targetX - pet.x);
-      if (distance < 60) return; // already close enough, don't fidget
+// --- Shimeji-style desktop physicality: Buddy can climb up onto the
+// frontmost window's title bar or the Dock and perch there for a while,
+// climb back down on its own, and startles/dodges if a window gets dragged
+// close to it. `climb` smoothly interpolates both x and y to a target over
+// a distance-scaled duration; `perched` is just idling once it arrives.
+function startClimb(targetX, targetY, source) {
+  const now = Date.now();
+  pet.mode = 'climb';
+  pet.climbFrom = { x: pet.x, y: pet.y };
+  pet.climbTo = { x: clampX(targetX), y: targetY };
+  pet.climbStart = now;
+  const distance = Math.hypot(pet.climbTo.x - pet.climbFrom.x, pet.climbTo.y - pet.climbFrom.y);
+  pet.climbDuration = Math.min(2600, Math.max(500, distance * 6));
+  pet.perchSource = source;
+  pet.dir = pet.climbTo.x >= pet.climbFrom.x ? 1 : -1;
+}
 
-      const gait = currentGait();
-      const now = Date.now();
-      pet.dir = targetX > pet.x ? 1 : -1;
-      pet.mode = 'walk';
-      pet.walkSpeed = gait.speed;
-      pet.walkStart = now;
-      pet.mechLastStep = now;
-      pet.modeUntil = now + Math.min(6000, (distance / gait.speed) * 1000 + 500);
-    })
-    .catch(() => {});
+function climbDown() {
+  const { height: sh } = screenBounds();
+  pet.perchWindowBounds = null;
+  startClimb(pet.x, sh - petSize.h, 'ground');
+}
+
+function tryPerch() {
+  if (!petWin || pet.mode !== 'idle' || pet.chatOpen) return;
+  if (Math.random() < 0.5) {
+    systemTools
+      .getFrontWindowBounds()
+      .then(({ window }) => {
+        if (!window || pet.mode !== 'idle' || pet.chatOpen) return;
+        const targetY = window.y - petSize.h + 14; // sit slightly overlapping the title bar
+        if (targetY < 0) return; // window too close to the top of the screen to perch on
+        const targetX = window.x + Math.min(40, Math.max(0, window.width - petSize.w - 10));
+        pet.perchWindowBounds = window;
+        startClimb(targetX, targetY, 'window');
+      })
+      .catch(() => {});
+  } else {
+    systemTools
+      .getDockBounds()
+      .then(({ dock }) => {
+        if (!dock || pet.mode !== 'idle' || pet.chatOpen) return;
+        const targetX = dock.x + Math.min(30, Math.max(0, dock.width - petSize.w - 10));
+        const targetY = dock.y - petSize.h + 6;
+        startClimb(targetX, targetY, 'dock');
+      })
+      .catch(() => {});
+  }
+}
+
+const STARTLE_LINES = ['Whoa!', 'Hey, watch it!', 'Yikes!', 'Look out!', 'Eek!'];
+
+function startle() {
+  if (!petWin || pet.mode === 'sleep' || pet.mode === 'dragging' || pet.mode === 'jump') return;
+  pet.jumpFromMode = pet.mode === 'perched' || pet.mode === 'climb' ? 'idle' : pet.mode;
+  pet.mode = 'jump';
+  pet.jumpStart = Date.now();
+  pet.dir *= -1;
+  petWin.webContents.send('pet-action', { type: 'jump' });
+  say(randomLine(STARTLE_LINES), { short: true });
+}
+
+// Polls the frontmost window's bounds frequently (cheap AppleScript call) so
+// Buddy can react like a Shimeji when a window is dragged close to it, and
+// climb down if the window it's perched on has moved away from under it.
+function startDragWatchLoop() {
+  dragWatchInterval = setInterval(async () => {
+    if (!petWin || pet.chatOpen || pet.mode === 'dragging' || pet.mode === 'sleep') return;
+    const { window } = await systemTools.getFrontWindowBounds();
+
+    if (pet.mode === 'perched' && pet.perchSource === 'window' && pet.perchWindowBounds) {
+      const b = pet.perchWindowBounds;
+      if (!window || Math.hypot(window.x - b.x, window.y - b.y) > 120) {
+        climbDown();
+        return;
+      }
+    }
+
+    if (!window) {
+      lastWindowBounds = null;
+      return;
+    }
+    const prev = lastWindowBounds;
+    lastWindowBounds = window;
+    if (!prev || (pet.mode !== 'idle' && pet.mode !== 'walk')) return;
+
+    const moved = Math.abs(window.x - prev.x) + Math.abs(window.y - prev.y);
+    if (moved < 25) return; // not really being dragged
+
+    const petCenterX = pet.x + petSize.w / 2;
+    const petCenterY = pet.groundY + petSize.h / 2;
+    const nearX = Math.max(window.x, Math.min(petCenterX, window.x + window.width));
+    const nearY = Math.max(window.y, Math.min(petCenterY, window.y + window.height));
+    const dist = Math.hypot(petCenterX - nearX, petCenterY - nearY);
+
+    if (dist < 90) startle();
+  }, 1200);
 }
 
 function createPetWindow() {
@@ -313,6 +422,83 @@ function createChatWindow() {
   });
 }
 
+// A separate small transparent window for the speech bubble, positioned
+// beside the pet (not on top of it) so the character is never covered while
+// it's talking — like a thought floating out from beside its head rather
+// than a sign hung in front of its face.
+function createBubbleWin() {
+  bubbleWin = new BrowserWindow({
+    width: BUBBLE_W,
+    height: BUBBLE_H,
+    frame: false,
+    transparent: true,
+    hasShadow: false,
+    resizable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    focusable: false,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
+
+  bubbleWin.setAlwaysOnTop(true, 'floating', 1);
+  bubbleWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  bubbleWin.setIgnoreMouseEvents(true);
+  bubbleWin.loadFile(path.join(__dirname, 'renderer', 'bubble.html'));
+  bubbleWin.on('closed', () => {
+    bubbleWin = null;
+  });
+}
+
+function positionBubble() {
+  if (!petWin || !bubbleWin) return;
+  const { width: sw, height: sh } = screenBounds();
+  const [px, py] = petWin.getPosition();
+  const [bw, bh] = bubbleWin.getSize();
+  const gap = 10;
+
+  const spaceRight = sw - (px + petSize.w);
+  const spaceLeft = px;
+  let x;
+  let side;
+  if (spaceRight >= bw + gap || spaceRight >= spaceLeft) {
+    x = px + petSize.w + gap;
+    side = 'left'; // tail sits on the bubble's left edge, pointing back at the pet
+  } else {
+    x = px - bw - gap;
+    side = 'right'; // tail sits on the bubble's right edge, pointing back at the pet
+  }
+  x = Math.min(Math.max(x, 0), sw - bw);
+
+  let y = py - bh * 0.15; // roughly level with the character's head
+  y = Math.min(Math.max(y, 0), sh - bh);
+
+  bubbleWin.setPosition(Math.round(x), Math.round(y));
+  bubbleWin.webContents.send('bubble-side', side);
+}
+
+// Every unprompted or replied line goes through here: shows the floating
+// bubble beside the pet, and separately tells the pet window whether to
+// speak it out loud (voice is only for full replies/proactive lines, not
+// short instant nags like hunger/petting acks).
+function say(text, { short = false } = {}) {
+  if (!petWin || !text) return;
+  if (!bubbleWin) createBubbleWin();
+  positionBubble();
+  bubbleWin.webContents.send('bubble-text', text);
+  bubbleWin.showInactive();
+  clearTimeout(bubbleHideTimer);
+  const ms = short ? 2600 : 9000;
+  bubbleHideTimer = setTimeout(() => {
+    if (bubbleWin) bubbleWin.hide();
+  }, ms);
+  petWin.webContents.send('speak-request', { text, voice: !short });
+}
+
 function positionChatNearPet() {
   if (!petWin || !chatWin) return;
   const { width: sw, height: sh } = screenBounds();
@@ -380,7 +566,8 @@ function handleEvolution(bond) {
   if (!bond.evolved) return;
   const species = getSpecies(state.getCharacter());
   const line = (species.evolveLines && species.evolveLines[bond.stage]) || null;
-  if (petWin) petWin.webContents.send('buddy-evolved', { stage: bond.stage, line });
+  if (petWin) petWin.webContents.send('buddy-evolved', { stage: bond.stage });
+  if (line) say(line);
 }
 
 function buildTrayMenu() {
@@ -440,7 +627,7 @@ function startProactiveLoop() {
         moodLabel,
         reason: `idle for ${Math.round(idleMinutes)} minutes`
       });
-      if (line) petWin.webContents.send('buddy-says', { text: line });
+      if (line) say(line);
     } catch (err) {
       // Silent fail (e.g. no API key yet).
     }
@@ -465,7 +652,7 @@ function startHungerLoop() {
     state.registerHungerNag();
     const species = getSpecies(state.getCharacter());
     const line = randomLine(species.hungryLines);
-    petWin.webContents.send('buddy-says', { text: line, short: true });
+    say(line, { short: true });
   }, 45000);
 }
 
@@ -482,17 +669,14 @@ function startAwarenessLoop() {
       focusTracker.since = now;
     } else if (activeApp && now - focusTracker.since > 60 * 60 * 1000 && state.canNagFocus() && !pet.chatOpen) {
       state.registerFocusNag();
-      petWin.webContents.send('buddy-says', {
-        text: `You've been in ${activeApp} for a while now — remember to blink!`,
-        short: true
-      });
+      say(`You've been in ${activeApp} for a while now — remember to blink!`, { short: true });
     }
 
     if (pet.chatOpen) return;
     const { event } = await systemTools.getNextCalendarEvent();
     if (event && event.title !== lastAnnouncedEventTitle) {
       lastAnnouncedEventTitle = event.title;
-      petWin.webContents.send('buddy-says', { text: `Heads up — "${event.title}" is coming up soon.`, short: true });
+      say(`Heads up — "${event.title}" is coming up soon.`, { short: true });
     } else if (!event) {
       lastAnnouncedEventTitle = null;
     }
@@ -508,17 +692,17 @@ function startAlertLoop() {
 
     if (status.battery && status.battery.percent <= 10 && status.battery.state === 'discharging' && state.canNagBattery()) {
       state.registerBatteryNag();
-      petWin.webContents.send('buddy-says', { text: `Uh oh — battery's at ${status.battery.percent}%. Might want to plug in!`, short: true });
+      say(`Uh oh — battery's at ${status.battery.percent}%. Might want to plug in!`, { short: true });
     } else if (status.disk && status.disk.freeGB < 5 && state.canNagDisk()) {
       state.registerDiskNag();
-      petWin.webContents.send('buddy-says', { text: `Your disk is almost full — only ${status.disk.freeGB}GB free.`, short: true });
+      say(`Your disk is almost full — only ${status.disk.freeGB}GB free.`, { short: true });
     }
   }, 90000);
 }
 
 function startPerchLoop() {
   perchInterval = setInterval(() => {
-    if (Math.random() < 0.35) tryApproachFrontWindow();
+    if (Math.random() < 0.35) tryPerch();
   }, 90000);
 }
 
@@ -563,7 +747,9 @@ const KIND_REACTIONS = {
 
 ipcMain.handle('feed-file', (_evt, filePath) => {
   if (typeof filePath !== 'string' || !systemTools.isWithinHome(filePath)) {
-    return { ok: false, error: 'I can only accept files from inside your home folder.' };
+    const error = 'I can only accept files from inside your home folder.';
+    say(error, { short: true });
+    return { ok: false, error };
   }
   lastUserInteraction = Date.now();
   const kind = systemTools.classifyFileKind(filePath);
@@ -580,12 +766,12 @@ ipcMain.handle('feed-file', (_evt, filePath) => {
   const line = KIND_REACTIONS[kind] || KIND_REACTIONS.other;
   if (bond.evolved) {
     handleEvolution(bond);
-  } else if (petWin) {
-    petWin.webContents.send('buddy-says', { text: line, short: true });
+  } else {
+    say(line, { short: true });
   }
-  if (isNew && petWin) {
+  if (isNew) {
     setTimeout(() => {
-      petWin.webContents.send('buddy-says', { text: `🏅 New badge: ${badge.emoji} ${badge.label}!`, short: true });
+      say(`🏅 New badge: ${badge.emoji} ${badge.label}!`, { short: true });
     }, 3200);
   }
   return { ok: true, line, kind, isNewBadge: isNew, badge, mood, bond };
@@ -619,8 +805,8 @@ ipcMain.handle('pet-pet', () => {
   const line = randomLine(species.petLines);
   if (bond.evolved) {
     handleEvolution(bond);
-  } else if (petWin) {
-    petWin.webContents.send('buddy-says', { text: line, short: true });
+  } else {
+    say(line, { short: true });
   }
   return { ok: true, line };
 });
@@ -643,8 +829,8 @@ ipcMain.handle('feed-pet', () => {
   const line = randomLine(species.feedLines);
   if (bond.evolved) {
     handleEvolution(bond);
-  } else if (petWin) {
-    petWin.webContents.send('buddy-says', { text: line, short: true });
+  } else {
+    say(line, { short: true });
   }
   return { ok: true, line, mood, bond };
 });
@@ -683,7 +869,7 @@ ipcMain.handle('send-message', async (_evt, text) => {
   try {
     const result = await claude.chat(text, { mood, moodLabel });
     state.appendHistory('assistant', result.text);
-    if (petWin) petWin.webContents.send('buddy-says', { text: result.text });
+    say(result.text);
     return {
       ok: true,
       reply: result.text,
@@ -751,6 +937,7 @@ app.whenReady().then(() => {
   startAwarenessLoop();
   startAlertLoop();
   startPerchLoop();
+  startDragWatchLoop();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createPetWindow();
@@ -764,5 +951,6 @@ app.on('window-all-closed', () => {
   clearInterval(awarenessInterval);
   clearInterval(alertInterval);
   clearInterval(perchInterval);
+  clearInterval(dragWatchInterval);
   app.quit();
 });
