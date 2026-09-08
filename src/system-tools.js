@@ -1,0 +1,191 @@
+// Read-only access to real information about the user's machine, plus one
+// narrow, validated way to open something it found. No shell strings are
+// built from user/model input — every external command runs via execFile
+// with a fixed argument array, so there is no injection surface even if a
+// query contains quotes or special characters.
+
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
+const { execFile } = require('child_process');
+const { shell } = require('electron');
+
+function run(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout: 8000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout);
+    });
+  });
+}
+
+function bytesToGB(bytes) {
+  return Math.round((bytes / 1024 / 1024 / 1024) * 10) / 10;
+}
+
+async function getBattery() {
+  try {
+    const out = await run('pmset', ['-g', 'batt']);
+    const pctMatch = out.match(/(\d+)%/);
+    const stateMatch = out.match(/;\s*(charging|discharging|charged|finishing charge)/i);
+    if (!pctMatch) return null;
+    return {
+      percent: Number(pctMatch[1]),
+      state: stateMatch ? stateMatch[1].toLowerCase() : 'unknown'
+    };
+  } catch {
+    return null; // desktop Macs / no battery
+  }
+}
+
+// os.freemem() alone is misleading on macOS: it doesn't count cached pages
+// that the OS would happily reclaim under pressure, so it usually reads as
+// "almost full" even on a healthy machine. vm_stat's free+inactive+
+// speculative pages is a much closer match to what Activity Monitor calls
+// available memory.
+async function getMemory() {
+  const totalGB = bytesToGB(os.totalmem());
+  try {
+    const out = await run('vm_stat', []);
+    const pageSizeMatch = out.match(/page size of (\d+) bytes/);
+    const pageSize = pageSizeMatch ? Number(pageSizeMatch[1]) : 4096;
+    const pagesOf = (label) => {
+      const m = out.match(new RegExp(`${label}:\\s+(\\d+)\\.`));
+      return m ? Number(m[1]) : 0;
+    };
+    const availablePages = pagesOf('Pages free') + pagesOf('Pages inactive') + pagesOf('Pages speculative');
+    const availableGB = bytesToGB(availablePages * pageSize);
+    return { totalGB, freeGB: availableGB, usedGB: Math.round((totalGB - availableGB) * 10) / 10 };
+  } catch {
+    const freeGB = bytesToGB(os.freemem());
+    return { totalGB, freeGB, usedGB: Math.round((totalGB - freeGB) * 10) / 10 };
+  }
+}
+
+async function getDisk() {
+  try {
+    const out = await run('df', ['-k', os.homedir()]);
+    const line = out.trim().split('\n').pop();
+    const cols = line.trim().split(/\s+/);
+    const totalKB = Number(cols[1]);
+    const usedKB = Number(cols[2]);
+    const availKB = Number(cols[3]);
+    return {
+      totalGB: bytesToGB(totalKB * 1024),
+      usedGB: bytesToGB(usedKB * 1024),
+      freeGB: bytesToGB(availKB * 1024),
+      percentUsed: Math.round((usedKB / totalKB) * 100)
+    };
+  } catch {
+    return null;
+  }
+}
+
+function formatUptime(seconds) {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (mins || parts.length === 0) parts.push(`${mins}m`);
+  return parts.join(' ');
+}
+
+async function getSystemStatus() {
+  const [battery, disk, memory] = await Promise.all([getBattery(), getDisk(), getMemory()]);
+  const load = os.loadavg()[0];
+  const cores = os.cpus().length;
+
+  return {
+    battery,
+    memory,
+    disk,
+    cpu: { cores, load1min: Math.round(load * 100) / 100, busyPercent: Math.min(100, Math.round((load / cores) * 100)) },
+    uptime: formatUptime(os.uptime()),
+    platform: `${os.platform()} ${os.release()}`
+  };
+}
+
+const LOCATION_PATHS = {
+  Desktop: () => path.join(os.homedir(), 'Desktop'),
+  Documents: () => path.join(os.homedir(), 'Documents'),
+  Downloads: () => path.join(os.homedir(), 'Downloads'),
+  Pictures: () => path.join(os.homedir(), 'Pictures'),
+  Home: () => os.homedir()
+};
+
+const KIND_QUERY = {
+  photo: 'kind:image',
+  image: 'kind:image',
+  document: 'kind:document',
+  pdf: 'kind:pdf',
+  video: 'kind:movie',
+  audio: 'kind:audio',
+  folder: 'kind:folder'
+};
+
+async function searchFiles({ query, kind, location, limit = 15 } = {}) {
+  const args = [];
+  const scopePath = location && LOCATION_PATHS[location] ? LOCATION_PATHS[location]() : null;
+  if (scopePath) args.push('-onlyin', scopePath);
+
+  if (kind && KIND_QUERY[kind]) {
+    const q = query ? `${KIND_QUERY[kind]} ${query}` : KIND_QUERY[kind];
+    args.push(q);
+  } else if (query) {
+    args.push('-name', query);
+  } else {
+    return { error: 'Need at least a query or a kind to search for.' };
+  }
+
+  let out;
+  try {
+    out = await run('mdfind', args);
+  } catch (err) {
+    return { error: `Search failed: ${err.message}` };
+  }
+
+  const paths = out.split('\n').filter(Boolean).slice(0, limit);
+  const results = paths.map((p) => {
+    let stat = null;
+    try {
+      stat = fs.statSync(p);
+    } catch {
+      // file may have moved/been deleted between mdfind indexing and now
+    }
+    return {
+      name: path.basename(p),
+      path: p,
+      isFolder: stat ? stat.isDirectory() : null,
+      sizeKB: stat && !stat.isDirectory() ? Math.round(stat.size / 1024) : null,
+      modified: stat ? stat.mtime.toISOString().slice(0, 10) : null
+    };
+  });
+
+  return { count: results.length, results };
+}
+
+function isWithinHome(targetPath) {
+  const resolved = path.resolve(targetPath);
+  const home = path.resolve(os.homedir());
+  return resolved === home || resolved.startsWith(home + path.sep);
+}
+
+async function openPath(targetPath) {
+  if (typeof targetPath !== 'string' || !targetPath.trim()) {
+    return { error: 'No path given.' };
+  }
+  const resolved = path.resolve(targetPath);
+  if (!isWithinHome(resolved)) {
+    return { error: 'For safety, I can only open files inside your home folder.' };
+  }
+  if (!fs.existsSync(resolved)) {
+    return { error: 'That path no longer exists.' };
+  }
+  const errorMsg = await shell.openPath(resolved);
+  if (errorMsg) return { error: errorMsg };
+  return { ok: true, opened: resolved };
+}
+
+module.exports = { getSystemStatus, searchFiles, openPath };

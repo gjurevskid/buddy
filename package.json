@@ -1,0 +1,35 @@
+{
+  "name": "desktop-buddy",
+  "version": "0.1.0",
+  "description": "A Clippy-style always-on desktop AI companion",
+  "main": "src/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
+    "electron-store": "^8.2.0"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.danielgjurevski.desktopbuddy",
+    "productName": "Buddy",
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": "dmg",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "Buddy uses your microphone so you can talk to it out loud.",
+        "NSSpeechRecognitionUsageDescription": "Buddy uses speech recognition to understand what you say."
+      }
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ]
+  }
+}

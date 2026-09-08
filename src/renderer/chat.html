@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Buddy Chat</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="chatApp">
+    <div id="welcomeRow" class="hidden">
+      <input id="userNameInput" type="text" placeholder="What's your name?" />
+      <button id="saveUserNameBtn">Save</button>
+    </div>
+
+    <div id="header" class="drag">
+      <span id="petNameLabel" class="no-drag"></span>
+      <div id="headerBtns" class="no-drag">
+        <button id="settingsBtn" title="Settings">⚙️</button>
+        <button id="closeBtn" title="Close">✕</button>
+      </div>
+    </div>
+
+    <div id="settingsPanel" class="no-drag hidden">
+      <div id="bondLine">
+        <div id="bondBar"><div id="bondFill"></div></div>
+        <span id="bondTitle"></span>
+      </div>
+      <div id="moodRow">
+        <div class="moodBar" title="Happiness"><div id="mHappiness" class="moodFill happiness"></div></div>
+        <div class="moodBar" title="Energy"><div id="mEnergy" class="moodFill energy"></div></div>
+        <div class="moodBar" title="Attention"><div id="mAttention" class="moodFill attention"></div></div>
+      </div>
+
+      <div id="renameRow">
+        <input id="petNameInput" type="text" maxlength="24" placeholder="Rename..." />
+        <button id="savePetNameBtn">Save</button>
+      </div>
+
+      <div id="picker"></div>
+
+      <div id="settingsActions">
+        <button id="feedBtn">🍎 Feed</button>
+        <button id="voiceBtn">🔇 Voice</button>
+      </div>
+
+      <button id="showKeyRowBtn">API keys</button>
+      <div id="keyRow" class="hidden">
+        <div id="providerList"></div>
+      </div>
+    </div>
+
+    <div id="log"></div>
+
+    <div id="inputRow">
+      <input id="textInput" type="text" placeholder="Say something..." />
+      <button id="micBtn" title="Talk">🎤</button>
+      <button id="sendBtn" title="Send">➤</button>
+    </div>
+  </div>
+
+  <script src="characters.js"></script>
+  <script src="chat.js"></script>
+</body>
+</html>
