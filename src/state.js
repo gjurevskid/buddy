@@ -2,7 +2,7 @@ const Store = require('electron-store');
 
 const store = new Store({
   defaults: {
-    apiKeys: { anthropic: '', openai: '', gemini: '' },
+    apiKeys: { anthropic: '', openai: '', gemini: '', ollama: '' },
     activeProvider: 'anthropic',
     mood: {
       happiness: 80,
@@ -20,14 +20,20 @@ const store = new Store({
     lastFeed: 0,
     timesFed: 0,
     lastHungerNag: 0,
-    voiceEnabled: false
+    voiceEnabled: false,
+    memories: [],
+    badges: [],
+    lastBatteryNag: 0,
+    lastDiskNag: 0,
+    lastFocusNag: 0,
+    usage: { day: '', anthropic: { inTok: 0, outTok: 0 }, openai: { inTok: 0, outTok: 0 }, gemini: { inTok: 0, outTok: 0 }, ollama: { inTok: 0, outTok: 0 } }
   }
 });
 
 const DECAY_PER_HOUR = { happiness: 3, energy: 10, attention: 6 };
 const MAX_HISTORY = 40;
 
-const PROVIDER_IDS = ['anthropic', 'openai', 'gemini'];
+const PROVIDER_IDS = ['anthropic', 'openai', 'gemini', 'ollama'];
 
 // Older versions stored a single Anthropic-only key under `apiKey`. Fold it
 // into the new per-provider map once, then drop the legacy field.
@@ -97,7 +103,7 @@ function appendHistory(role, content) {
   store.set('history', history);
 }
 
-const ENV_FALLBACK = { anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY', gemini: 'GEMINI_API_KEY' };
+const ENV_FALLBACK = { anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY', gemini: 'GEMINI_API_KEY', ollama: 'OLLAMA_MODEL' };
 
 function getApiKeys() {
   return store.get('apiKeys');
@@ -275,6 +281,123 @@ function setVoiceEnabled(enabled) {
   store.set('voiceEnabled', !!enabled);
 }
 
+// --- Long-term memory: short facts the model chooses to save about the
+// user, separate from the rolling chat history (which is capped and trimmed).
+// This is what lets Buddy "remember" things weeks later.
+const MAX_MEMORIES = 40;
+
+function getMemories() {
+  return store.get('memories');
+}
+
+function addMemory(text) {
+  const trimmed = (text || '').trim().slice(0, 200);
+  if (!trimmed) return getMemories();
+  const memories = store.get('memories');
+  if (memories.some((m) => m.text.toLowerCase() === trimmed.toLowerCase())) return memories;
+  memories.push({ text: trimmed, ts: Date.now() });
+  while (memories.length > MAX_MEMORIES) memories.shift();
+  store.set('memories', memories);
+  return memories;
+}
+
+function clearMemories() {
+  store.set('memories', []);
+}
+
+// --- Badges: cosmetic unlocks from feeding Buddy different kinds of files,
+// on top of the always-on feed-gated evolution mechanic.
+const BADGES = {
+  photo: { label: 'Photo Fan', emoji: '🖼️' },
+  document: { label: 'Bookworm', emoji: '📄' },
+  pdf: { label: 'Paper Trail', emoji: '📑' },
+  video: { label: 'Movie Buff', emoji: '🎬' },
+  audio: { label: 'Music Lover', emoji: '🎵' },
+  code: { label: 'Code Buddy', emoji: '💻' },
+  archive: { label: 'Treasure Hunter', emoji: '🗜️' },
+  other: { label: 'Curious Eater', emoji: '🍽️' }
+};
+
+function getBadges() {
+  return store.get('badges');
+}
+
+function unlockBadge(kind) {
+  const def = BADGES[kind] || BADGES.other;
+  const badges = store.get('badges');
+  if (badges.includes(kind)) return { isNew: false, badge: def };
+  badges.push(kind);
+  store.set('badges', badges);
+  return { isNew: true, badge: def };
+}
+
+// --- Proactive-alert cooldowns: same pattern as the hunger nag, one per
+// nag type so battery/disk/focus nudges don't spam on top of each other.
+const BATTERY_NAG_COOLDOWN_MS = 20 * 60 * 1000;
+const DISK_NAG_COOLDOWN_MS = 60 * 60 * 1000;
+const FOCUS_NAG_COOLDOWN_MS = 45 * 60 * 1000;
+
+function canNagBattery() {
+  return Date.now() - store.get('lastBatteryNag') > BATTERY_NAG_COOLDOWN_MS;
+}
+function registerBatteryNag() {
+  store.set('lastBatteryNag', Date.now());
+}
+function canNagDisk() {
+  return Date.now() - store.get('lastDiskNag') > DISK_NAG_COOLDOWN_MS;
+}
+function registerDiskNag() {
+  store.set('lastDiskNag', Date.now());
+}
+function canNagFocus() {
+  return Date.now() - store.get('lastFocusNag') > FOCUS_NAG_COOLDOWN_MS;
+}
+function registerFocusNag() {
+  store.set('lastFocusNag', Date.now());
+}
+
+// --- Rough per-provider token usage, reset daily. Pricing is approximate
+// (blended, order-of-magnitude) — this is meant as a "which vendor am I
+// burning through" indicator, not an invoice.
+const USD_PER_1K_TOKENS = {
+  anthropic: { in: 0.003, out: 0.015 },
+  openai: { in: 0.00015, out: 0.0006 },
+  gemini: { in: 0.0, out: 0.0 }, // free tier by default
+  ollama: { in: 0, out: 0 } // local, always free
+};
+
+function todayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function getUsage() {
+  const usage = store.get('usage');
+  if (usage.day !== todayKey()) {
+    const reset = { day: todayKey(), anthropic: { inTok: 0, outTok: 0 }, openai: { inTok: 0, outTok: 0 }, gemini: { inTok: 0, outTok: 0 }, ollama: { inTok: 0, outTok: 0 } };
+    store.set('usage', reset);
+    return reset;
+  }
+  return usage;
+}
+
+function addUsage(provider, inTok, outTok) {
+  if (!PROVIDER_IDS.includes(provider)) return;
+  const usage = getUsage();
+  const current = usage[provider] || { inTok: 0, outTok: 0 };
+  usage[provider] = { inTok: current.inTok + (inTok || 0), outTok: current.outTok + (outTok || 0) };
+  store.set('usage', usage);
+}
+
+function getUsageSummary() {
+  const usage = getUsage();
+  return PROVIDER_IDS.map((p) => {
+    const { inTok, outTok } = usage[p] || { inTok: 0, outTok: 0 };
+    const rate = USD_PER_1K_TOKENS[p] || { in: 0, out: 0 };
+    const costUSD = (inTok / 1000) * rate.in + (outTok / 1000) * rate.out;
+    return { provider: p, inTok, outTok, costUSD: Math.round(costUSD * 10000) / 10000 };
+  });
+}
+
 module.exports = {
   getMood,
   boostMood,
@@ -305,5 +428,19 @@ module.exports = {
   canNagHunger,
   registerHungerNag,
   getVoiceEnabled,
-  setVoiceEnabled
+  setVoiceEnabled,
+  getMemories,
+  addMemory,
+  clearMemories,
+  getBadges,
+  unlockBadge,
+  canNagBattery,
+  registerBatteryNag,
+  canNagDisk,
+  registerDiskNag,
+  canNagFocus,
+  registerFocusNag,
+  getUsage,
+  addUsage,
+  getUsageSummary
 };

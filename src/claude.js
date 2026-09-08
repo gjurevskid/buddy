@@ -33,6 +33,28 @@ const TOOLS = [
       properties: { path: { type: 'string', description: 'Absolute path to open.' } },
       required: ['path']
     }
+  },
+  {
+    name: 'remember_fact',
+    description:
+      "Save one short, important fact about the user for future conversations — a preference, an ongoing situation, a plan, something they care about. Use this whenever the user shares something worth remembering long-term (not small talk). Keep it to one clear sentence.",
+    input_schema: {
+      type: 'object',
+      properties: { fact: { type: 'string', description: 'The fact to remember, as one short sentence.' } },
+      required: ['fact']
+    }
+  },
+  {
+    name: 'get_active_app',
+    description:
+      "See which application the user currently has open/focused on their screen right now. Use this if asked what they're working on, or to react naturally to their current activity.",
+    input_schema: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: 'get_next_calendar_event',
+    description:
+      "Check the user's Calendar app for their next upcoming event in the next couple of hours. Use this if asked about their schedule/next meeting, or to warn them something is coming up soon.",
+    input_schema: { type: 'object', properties: {}, required: [] }
   }
 ];
 
@@ -73,6 +95,12 @@ async function runTool(name, input) {
     if (name === 'get_system_status') return await systemTools.getSystemStatus();
     if (name === 'search_files') return await systemTools.searchFiles(input || {});
     if (name === 'open_path') return await systemTools.openPath(input && input.path);
+    if (name === 'remember_fact') {
+      state.addMemory(input && input.fact);
+      return { ok: true };
+    }
+    if (name === 'get_active_app') return await systemTools.getActiveApp();
+    if (name === 'get_next_calendar_event') return await systemTools.getNextCalendarEvent();
     return { error: `Unknown tool: ${name}` };
   } catch (err) {
     return { error: err.message || 'Tool failed.' };
@@ -93,16 +121,22 @@ function buildSystemPrompt({ mood, moodLabel }) {
     ? `Current mood stats: happiness ${Math.round(mood.happiness)}, energy ${Math.round(mood.energy)}, attention ${Math.round(mood.attention)} (feeling ${moodLabel}). This is short-term and can dip even in a close relationship — don't confuse it with the bond level above, and don't confuse it with real battery/CPU stats from your tools either — those are two separate things.`
     : '';
 
+  const memories = state.getMemories();
+  const memoryPart = memories.length
+    ? `Things you remember about the user from past conversations:\n${memories.slice(-15).map((m) => `- ${m.text}`).join('\n')}\nWeave these in naturally when relevant — don't recite them like a list, and don't force one in if it doesn't fit.`
+    : '';
+
   return `You are ${petName}, a ${state.getCharacter()} who lives right on the user's computer screen as their desktop companion — not a generic assistant, and not just a toy either: you genuinely live on this machine and can tell them what's going on with it. ${species.personality}
 
 ${userPart}
 ${bondPart}
 
-You have real tools: get_system_status (battery, memory, disk, CPU, uptime) and search_files (find files/photos/documents by name, kind, or folder), plus open_path to open something you found. Use them naturally whenever the user asks something they'd answer — "how's my battery", "find my resume", "what's eating my storage", "open my vacation photos" — don't ask permission first, just check and report back in your own voice. Summarize results conversationally, never as a raw list or table. If a search finds nothing, say so plainly rather than guessing. For anything outside these tools (opening arbitrary apps, browsing the web, writing code, changing settings) be honest in-character that you can't do that yet.
+You have real tools: get_system_status (battery, memory, disk, CPU, uptime), search_files (find files/photos/documents by name, kind, or folder), open_path (open something you found), get_active_app (see what app the user currently has open), and get_next_calendar_event (their next upcoming meeting/event). Use them naturally whenever the user asks something they'd answer — "how's my battery", "find my resume", "what am I even doing right now", "what's next on my calendar" — don't ask permission first, just check and report back in your own voice. Summarize results conversationally, never as a raw list or table. If a search or check finds nothing, say so plainly rather than guessing. You also have remember_fact — call it whenever the user shares something worth remembering long-term (a preference, a plan, an ongoing situation), so you can bring it up naturally later. For anything outside these tools (opening arbitrary apps, browsing the web, writing code, changing settings) be honest in-character that you can't do that yet.
 
 Keep replies SHORT — 1-3 sentences, chat-bubble sized. No markdown, no headers, no bullet lists. Speak in character, in your own voice and speech quirks, not like an assistant delivering documentation. Never break character or mention being an AI model.
 
-${moodPart}`;
+${moodPart}
+${memoryPart}`;
 }
 
 function extractText(content) {
@@ -144,6 +178,8 @@ async function anthropicChat(userMessage, { mood, moodLabel } = {}) {
     .concat([{ role: 'user', content: userMessage }]);
 
   const system = buildSystemPrompt({ mood, moodLabel });
+  let totalIn = 0;
+  let totalOut = 0;
 
   for (let round = 0; round < 4; round++) {
     let response;
@@ -159,8 +195,14 @@ async function anthropicChat(userMessage, { mood, moodLabel } = {}) {
       throw tagProviderError('anthropic', err);
     }
 
+    if (response.usage) {
+      totalIn += response.usage.input_tokens || 0;
+      totalOut += response.usage.output_tokens || 0;
+    }
+
     const toolUses = response.content.filter((block) => block.type === 'tool_use');
     if (toolUses.length === 0) {
+      state.addUsage('anthropic', totalIn, totalOut);
       return extractText(response.content);
     }
 
@@ -177,6 +219,7 @@ async function anthropicChat(userMessage, { mood, moodLabel } = {}) {
     messages.push({ role: 'user', content: toolResults });
   }
 
+  state.addUsage('anthropic', totalIn, totalOut);
   return "Hmm, I got a bit lost digging through your files — mind asking again?";
 }
 
@@ -196,6 +239,7 @@ async function anthropicProactive({ mood, moodLabel, reason }) {
         }
       ]
     });
+    if (response.usage) state.addUsage('anthropic', response.usage.input_tokens || 0, response.usage.output_tokens || 0);
     return extractText(response.content);
   } catch (err) {
     throw tagProviderError('anthropic', err);
@@ -230,6 +274,8 @@ async function openaiChat(userMessage, { mood, moodLabel } = {}) {
     { role: 'user', content: userMessage }
   ];
   const tools = openaiTools();
+  let totalIn = 0;
+  let totalOut = 0;
 
   for (let round = 0; round < 4; round++) {
     let data;
@@ -239,8 +285,14 @@ async function openaiChat(userMessage, { mood, moodLabel } = {}) {
       throw tagProviderError('openai', err);
     }
 
+    if (data.usage) {
+      totalIn += data.usage.prompt_tokens || 0;
+      totalOut += data.usage.completion_tokens || 0;
+    }
+
     const msg = data.choices[0].message;
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
+      state.addUsage('openai', totalIn, totalOut);
       return (msg.content || '').trim();
     }
 
@@ -257,6 +309,7 @@ async function openaiChat(userMessage, { mood, moodLabel } = {}) {
     }
   }
 
+  state.addUsage('openai', totalIn, totalOut);
   return "Hmm, I got a bit lost digging through your files — mind asking again?";
 }
 
@@ -276,6 +329,7 @@ async function openaiProactive({ mood, moodLabel, reason }) {
         }
       ]
     });
+    if (data.usage) state.addUsage('openai', data.usage.prompt_tokens || 0, data.usage.completion_tokens || 0);
     return (data.choices[0].message.content || '').trim();
   } catch (err) {
     throw tagProviderError('openai', err);
@@ -335,6 +389,9 @@ async function geminiChat(userMessage, { mood, moodLabel } = {}) {
     contents
   };
 
+  let totalIn = 0;
+  let totalOut = 0;
+
   for (let round = 0; round < 4; round++) {
     let data;
     try {
@@ -343,9 +400,15 @@ async function geminiChat(userMessage, { mood, moodLabel } = {}) {
       throw tagProviderError('gemini', err);
     }
 
+    if (data.usageMetadata) {
+      totalIn += data.usageMetadata.promptTokenCount || 0;
+      totalOut += data.usageMetadata.candidatesTokenCount || 0;
+    }
+
     const candidate = data.candidates && data.candidates[0];
     const calls = geminiFunctionCallsOf(candidate);
     if (calls.length === 0) {
+      state.addUsage('gemini', totalIn, totalOut);
       return geminiTextOf(candidate);
     }
 
@@ -358,6 +421,7 @@ async function geminiChat(userMessage, { mood, moodLabel } = {}) {
     body.contents.push({ role: 'function', parts: responseParts });
   }
 
+  state.addUsage('gemini', totalIn, totalOut);
   return "Hmm, I got a bit lost digging through your files — mind asking again?";
 }
 
@@ -380,9 +444,105 @@ async function geminiProactive({ mood, moodLabel, reason }) {
         }
       ]
     });
+    if (data.usageMetadata) state.addUsage('gemini', data.usageMetadata.promptTokenCount || 0, data.usageMetadata.candidatesTokenCount || 0);
     return geminiTextOf(data.candidates && data.candidates[0]);
   } catch (err) {
     throw tagProviderError('gemini', err);
+  }
+}
+
+// --- Provider: local Ollama model ---
+// No API key/cost — this is the free, offline, final-resort fallback. The
+// "key" field for this provider holds a model tag (e.g. "llama3.1") instead
+// of a secret, since there's nothing to authenticate.
+
+const OLLAMA_URL = 'http://localhost:11434/api/chat';
+
+async function ollamaRequest(body) {
+  let res;
+  try {
+    res = await fetch(OLLAMA_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+  } catch (err) {
+    throw new Error('Ollama is not reachable — is it running locally?');
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error((data.error && data.error.message) || data.error || `Ollama request failed (${res.status})`);
+  }
+  return data;
+}
+
+function ollamaToolArgs(call) {
+  const raw = call.function && call.function.arguments;
+  if (!raw) return {};
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return raw;
+}
+
+async function ollamaChat(userMessage, { mood, moodLabel } = {}) {
+  const model = state.getApiKey('ollama');
+  if (!model) throw providerError('ollama', 'NO_API_KEY');
+
+  const history = state.getHistory();
+  const messages = [
+    { role: 'system', content: buildSystemPrompt({ mood, moodLabel }) },
+    ...history.slice(-20).map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })),
+    { role: 'user', content: userMessage }
+  ];
+  const tools = openaiTools(); // Ollama's tool schema matches OpenAI's shape
+
+  for (let round = 0; round < 4; round++) {
+    let data;
+    try {
+      data = await ollamaRequest({ model, messages, tools, stream: false });
+    } catch (err) {
+      throw tagProviderError('ollama', err);
+    }
+
+    const msg = data.message || {};
+    if (!msg.tool_calls || msg.tool_calls.length === 0) {
+      return (msg.content || '').trim();
+    }
+
+    messages.push(msg);
+    for (const call of msg.tool_calls) {
+      const result = await runTool(call.function.name, ollamaToolArgs(call));
+      messages.push({ role: 'tool', content: JSON.stringify(result) });
+    }
+  }
+
+  return "Hmm, I got a bit lost digging through your files — mind asking again?";
+}
+
+async function ollamaProactive({ mood, moodLabel, reason }) {
+  const model = state.getApiKey('ollama');
+  if (!model) throw providerError('ollama', 'NO_API_KEY');
+
+  try {
+    const data = await ollamaRequest({
+      model,
+      stream: false,
+      messages: [
+        { role: 'system', content: buildSystemPrompt({ mood, moodLabel }) },
+        {
+          role: 'user',
+          content: `[system note, not from the user] You haven't spoken in a while. Reason: ${reason}. Say ONE short, in-character thing to the user on your own initiative — a comment, a nudge for attention, a little observation, or a joke fitting your personality. Do not mention this note, and do not use any tools for this one.`
+        }
+      ]
+    });
+    return ((data.message && data.message.content) || '').trim();
+  } catch (err) {
+    throw tagProviderError('ollama', err);
   }
 }
 
@@ -391,9 +551,10 @@ async function geminiProactive({ mood, moodLabel, reason }) {
 const PROVIDERS = {
   anthropic: { chat: anthropicChat, proactive: anthropicProactive, label: 'Claude' },
   openai: { chat: openaiChat, proactive: openaiProactive, label: 'GPT' },
-  gemini: { chat: geminiChat, proactive: geminiProactive, label: 'Gemini' }
+  gemini: { chat: geminiChat, proactive: geminiProactive, label: 'Gemini' },
+  ollama: { chat: ollamaChat, proactive: ollamaProactive, label: 'Local model' }
 };
-const PROVIDER_ORDER = ['anthropic', 'openai', 'gemini'];
+const PROVIDER_ORDER = ['anthropic', 'openai', 'gemini', 'ollama'];
 
 function fallbackOrder() {
   const active = state.getActiveProvider();

@@ -1,7 +1,10 @@
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 contextBridge.exposeInMainWorld('buddy', {
   getInitState: () => ipcRenderer.invoke('get-init-state'),
+  clearMemories: () => ipcRenderer.invoke('clear-memories'),
+  feedFile: (path) => ipcRenderer.invoke('feed-file', path),
+  getPathForFile: (file) => webUtils.getPathForFile(file),
   setApiKey: (provider, key) => ipcRenderer.invoke('set-api-key', { provider, key }),
   setActiveProvider: (provider) => ipcRenderer.invoke('set-active-provider', provider),
   sendMessage: (text) => ipcRenderer.invoke('send-message', text),

@@ -172,6 +172,102 @@ function isWithinHome(targetPath) {
   return resolved === home || resolved.startsWith(home + path.sep);
 }
 
+// AppleScript-backed context tools. Each is wrapped defensively: Calendar/
+// System Events scripting can be slow, denied by the user (TCC prompt), or
+// simply return nothing — none of that should ever crash the caller.
+function runOsascript(script, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    execFile('osascript', ['-e', script], { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout.trim());
+    });
+  });
+}
+
+async function getActiveApp() {
+  try {
+    const name = await runOsascript(
+      'tell application "System Events" to get name of first application process whose frontmost is true'
+    );
+    return { app: name || null };
+  } catch (err) {
+    return { error: 'Could not read the frontmost app (accessibility permission may be needed).' };
+  }
+}
+
+async function getFrontWindowBounds() {
+  try {
+    const script = `
+      tell application "System Events"
+        set frontApp to first application process whose frontmost is true
+        set frontWin to front window of frontApp
+        set {winX, winY} to position of frontWin
+        set {winW, winH} to size of frontWin
+        return (name of frontApp) & "," & winX & "," & winY & "," & winW & "," & winH
+      end tell
+    `;
+    const out = await runOsascript(script, 4000);
+    const [appName, x, y, w, h] = out.split(',').map((s) => s.trim());
+    if (!x) return { window: null };
+    return { window: { app: appName, x: Number(x), y: Number(y), width: Number(w), height: Number(h) } };
+  } catch {
+    return { window: null };
+  }
+}
+
+async function getNextCalendarEvent() {
+  try {
+    // Scoped to a 2-hour lookahead and a hard timeout: Calendar.app's
+    // scripting bridge can be very slow across many calendars, and this is
+    // meant to be a quick ambient check, not a full agenda dump.
+    const script = `
+      set nowDate to current date
+      set laterDate to nowDate + (2 * hours)
+      tell application "Calendar"
+        set upcoming to {}
+        repeat with cal in calendars
+          try
+            set evts to (every event of cal whose start date ≥ nowDate and start date ≤ laterDate)
+            repeat with e in evts
+              set end of upcoming to {summary of e, start date of e}
+            end repeat
+          end try
+        end repeat
+      end tell
+      if (count of upcoming) is 0 then return "NONE"
+      set soonest to item 1 of upcoming
+      repeat with u in upcoming
+        if (item 2 of u) < (item 2 of soonest) then set soonest to u
+      end repeat
+      return (item 1 of soonest) & "||" & ((item 2 of soonest) as string)
+    `;
+    const out = await runOsascript(script, 6000);
+    if (!out || out === 'NONE') return { event: null };
+    const [title, when] = out.split('||');
+    return { event: { title: title.trim(), start: (when || '').trim() } };
+  } catch {
+    return { event: null, error: 'Could not read Calendar (permission may be needed).' };
+  }
+}
+
+const KIND_BY_EXT = {
+  photo: ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.bmp', '.tiff'],
+  video: ['.mp4', '.mov', '.avi', '.mkv', '.webm'],
+  audio: ['.mp3', '.wav', '.aac', '.flac', '.m4a', '.ogg'],
+  pdf: ['.pdf'],
+  document: ['.doc', '.docx', '.txt', '.pages', '.rtf', '.md', '.odt'],
+  code: ['.js', '.ts', '.py', '.java', '.c', '.cpp', '.go', '.rs', '.swift', '.html', '.css', '.json', '.jsx', '.tsx'],
+  archive: ['.zip', '.rar', '.7z', '.tar', '.gz']
+};
+
+function classifyFileKind(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  for (const [kind, exts] of Object.entries(KIND_BY_EXT)) {
+    if (exts.includes(ext)) return kind;
+  }
+  return 'other';
+}
+
 async function openPath(targetPath) {
   if (typeof targetPath !== 'string' || !targetPath.trim()) {
     return { error: 'No path given.' };
@@ -188,4 +284,13 @@ async function openPath(targetPath) {
   return { ok: true, opened: resolved };
 }
 
-module.exports = { getSystemStatus, searchFiles, openPath };
+module.exports = {
+  getSystemStatus,
+  searchFiles,
+  openPath,
+  isWithinHome,
+  getActiveApp,
+  getFrontWindowBounds,
+  getNextCalendarEvent,
+  classifyFileKind
+};

@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, screen, Tray, Menu, nativeImage, session } 
 const path = require('path');
 const state = require('./state');
 const claude = require('./claude');
+const systemTools = require('./system-tools');
 const { getSpecies, randomLine } = require('./reactions');
 
 let petWin;
@@ -11,6 +12,14 @@ let lastUserInteraction = Date.now();
 let proactiveInterval;
 let moodPushInterval;
 let hungerInterval;
+let awarenessInterval;
+let alertInterval;
+let perchInterval;
+
+// In-memory only (not persisted): which app has been frontmost and since
+// when, and which calendar event we've already announced this run.
+const focusTracker = { app: null, since: Date.now() };
+let lastAnnouncedEventTitle = null;
 
 const PET_W = 220;
 const PET_H = 200;
@@ -199,6 +208,33 @@ function resetPetPosition() {
   pet.modeUntil = Date.now() + 2000;
   if (petWin) petWin.setPosition(Math.round(pet.x), Math.round(pet.groundY));
   sendPetUpdate(true);
+}
+
+// Lightweight take on Shimeji-style desktop physicality: rather than fully
+// climbing on top of other windows (which needs low-level window-layer
+// APIs), Buddy occasionally ambles over to stand near whatever window is
+// currently in front — using the same tuned walk physics as normal roaming.
+function tryApproachFrontWindow() {
+  if (!petWin || pet.mode !== 'idle' || pet.chatOpen) return;
+  systemTools
+    .getFrontWindowBounds()
+    .then(({ window }) => {
+      if (!window || pet.mode !== 'idle' || pet.chatOpen) return;
+      const targetCenter = window.x + window.width / 2;
+      const targetX = clampX(targetCenter - petSize.w / 2);
+      const distance = Math.abs(targetX - pet.x);
+      if (distance < 60) return; // already close enough, don't fidget
+
+      const gait = currentGait();
+      const now = Date.now();
+      pet.dir = targetX > pet.x ? 1 : -1;
+      pet.mode = 'walk';
+      pet.walkSpeed = gait.speed;
+      pet.walkStart = now;
+      pet.mechLastStep = now;
+      pet.modeUntil = now + Math.min(6000, (distance / gait.speed) * 1000 + 500);
+    })
+    .catch(() => {});
 }
 
 function createPetWindow() {
@@ -433,6 +469,59 @@ function startHungerLoop() {
   }, 45000);
 }
 
+// Tracks how long the same app has stayed frontmost, and nudges the user if
+// they've been marathoning one app for a long stretch. No LLM call — this is
+// a canned, in-character line, same pattern as the hunger nag.
+function startAwarenessLoop() {
+  awarenessInterval = setInterval(async () => {
+    if (!petWin || !petWin.isVisible()) return;
+    const { app: activeApp } = await systemTools.getActiveApp();
+    const now = Date.now();
+    if (activeApp && activeApp !== focusTracker.app) {
+      focusTracker.app = activeApp;
+      focusTracker.since = now;
+    } else if (activeApp && now - focusTracker.since > 60 * 60 * 1000 && state.canNagFocus() && !pet.chatOpen) {
+      state.registerFocusNag();
+      petWin.webContents.send('buddy-says', {
+        text: `You've been in ${activeApp} for a while now — remember to blink!`,
+        short: true
+      });
+    }
+
+    if (pet.chatOpen) return;
+    const { event } = await systemTools.getNextCalendarEvent();
+    if (event && event.title !== lastAnnouncedEventTitle) {
+      lastAnnouncedEventTitle = event.title;
+      petWin.webContents.send('buddy-says', { text: `Heads up — "${event.title}" is coming up soon.`, short: true });
+    } else if (!event) {
+      lastAnnouncedEventTitle = null;
+    }
+  }, 5 * 60 * 1000);
+}
+
+// Battery/disk running low is worth an unprompted warning, same cooldown
+// pattern as every other nag loop.
+function startAlertLoop() {
+  alertInterval = setInterval(async () => {
+    if (!petWin || !petWin.isVisible() || pet.chatOpen) return;
+    const status = await systemTools.getSystemStatus();
+
+    if (status.battery && status.battery.percent <= 10 && status.battery.state === 'discharging' && state.canNagBattery()) {
+      state.registerBatteryNag();
+      petWin.webContents.send('buddy-says', { text: `Uh oh — battery's at ${status.battery.percent}%. Might want to plug in!`, short: true });
+    } else if (status.disk && status.disk.freeGB < 5 && state.canNagDisk()) {
+      state.registerDiskNag();
+      petWin.webContents.send('buddy-says', { text: `Your disk is almost full — only ${status.disk.freeGB}GB free.`, short: true });
+    }
+  }, 90000);
+}
+
+function startPerchLoop() {
+  perchInterval = setInterval(() => {
+    if (Math.random() < 0.35) tryApproachFrontWindow();
+  }, 90000);
+}
+
 ipcMain.handle('get-init-state', () => {
   const mood = state.getMood();
   const character = state.getCharacter();
@@ -449,8 +538,57 @@ ipcMain.handle('get-init-state', () => {
     petName: state.getPetName() || species.defaultName,
     userName: state.getUserName(),
     bond: state.getBond(),
-    voiceEnabled: state.getVoiceEnabled()
+    voiceEnabled: state.getVoiceEnabled(),
+    memories: state.getMemories(),
+    badges: state.getBadges(),
+    usage: state.getUsageSummary()
   };
+});
+
+ipcMain.handle('clear-memories', () => {
+  state.clearMemories();
+  return true;
+});
+
+const KIND_REACTIONS = {
+  photo: 'Ooh, a photo! Thanks for sharing that with me. 📸',
+  document: 'A document, huh? Consider it read (sort of). 📄',
+  pdf: 'Mmm, crunchy PDF. My favorite kind of paperwork. 📑',
+  video: 'A video snack — I love a good motion picture. 🎬',
+  audio: 'I can almost hear this one. Nice find. 🎵',
+  code: 'Beep boop, delicious syntax. 💻',
+  archive: 'A zipped-up treat! Wonder what is inside. 🗜️',
+  other: 'Thanks for the snack — not sure what it was, but I appreciate it!'
+};
+
+ipcMain.handle('feed-file', (_evt, filePath) => {
+  if (typeof filePath !== 'string' || !systemTools.isWithinHome(filePath)) {
+    return { ok: false, error: 'I can only accept files from inside your home folder.' };
+  }
+  lastUserInteraction = Date.now();
+  const kind = systemTools.classifyFileKind(filePath);
+  const mood = state.boostMood({ energy: 12, happiness: 6 });
+  const bond = state.addBondXp(3);
+  broadcastMood(mood);
+  broadcastBond(bond);
+  if (pet.mode === 'sleep' && mood.energy > SLEEP_ENERGY_IN) {
+    pet.mode = 'idle';
+    pet.modeUntil = Date.now() + 1500;
+  }
+
+  const { isNew, badge } = state.unlockBadge(kind);
+  const line = KIND_REACTIONS[kind] || KIND_REACTIONS.other;
+  if (bond.evolved) {
+    handleEvolution(bond);
+  } else if (petWin) {
+    petWin.webContents.send('buddy-says', { text: line, short: true });
+  }
+  if (isNew && petWin) {
+    setTimeout(() => {
+      petWin.webContents.send('buddy-says', { text: `🏅 New badge: ${badge.emoji} ${badge.label}!`, short: true });
+    }, 3200);
+  }
+  return { ok: true, line, kind, isNewBadge: isNew, badge, mood, bond };
 });
 
 ipcMain.handle('set-pet-name', (_evt, name) => {
@@ -552,7 +690,8 @@ ipcMain.handle('send-message', async (_evt, text) => {
       mood,
       moodLabel,
       provider: result.provider,
-      switched: result.switched
+      switched: result.switched,
+      usage: state.getUsageSummary()
     };
   } catch (err) {
     if (err.code === 'NO_API_KEY') {
@@ -609,6 +748,9 @@ app.whenReady().then(() => {
   startProactiveLoop();
   startMoodPushLoop();
   startHungerLoop();
+  startAwarenessLoop();
+  startAlertLoop();
+  startPerchLoop();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createPetWindow();
@@ -619,5 +761,8 @@ app.on('window-all-closed', () => {
   clearInterval(proactiveInterval);
   clearInterval(moodPushInterval);
   clearInterval(hungerInterval);
+  clearInterval(awarenessInterval);
+  clearInterval(alertInterval);
+  clearInterval(perchInterval);
   app.quit();
 });

@@ -22,17 +22,24 @@ const bondFill = document.getElementById('bondFill');
 const bondTitle = document.getElementById('bondTitle');
 const feedBtn = document.getElementById('feedBtn');
 const voiceBtn = document.getElementById('voiceBtn');
+const badgeRow = document.getElementById('badgeRow');
+const showMemoryRowBtn = document.getElementById('showMemoryRowBtn');
+const memoryRow = document.getElementById('memoryRow');
+const memoryList = document.getElementById('memoryList');
+const clearMemoryBtn = document.getElementById('clearMemoryBtn');
+const usageSummary = document.getElementById('usageSummary');
 
 let hasApiKey = false;
 let currentCharacter = 'robot';
 let voiceEnabled = false;
-let keysSet = { anthropic: false, openai: false, gemini: false };
+let keysSet = { anthropic: false, openai: false, gemini: false, ollama: false };
 let activeProvider = 'anthropic';
 
 const PROVIDER_META = {
   anthropic: { label: 'Claude (Anthropic)', placeholder: 'Paste Anthropic API key' },
   openai: { label: 'GPT (OpenAI)', placeholder: 'Paste OpenAI API key' },
-  gemini: { label: 'Gemini (Google)', placeholder: 'Paste Google AI Studio key' }
+  gemini: { label: 'Gemini (Google)', placeholder: 'Paste Google AI Studio key' },
+  ollama: { label: 'Local model (Ollama)', placeholder: 'Model name, e.g. llama3.1' }
 };
 
 function renderProviderList() {
@@ -65,7 +72,7 @@ function renderProviderList() {
     const inputRow = document.createElement('div');
     inputRow.className = 'providerInputRow';
     const input = document.createElement('input');
-    input.type = 'password';
+    input.type = id === 'ollama' ? 'text' : 'password';
     input.placeholder = meta.placeholder;
     const saveBtn = document.createElement('button');
     saveBtn.textContent = keysSet[id] ? 'Update' : 'Save';
@@ -92,6 +99,61 @@ function renderProviderList() {
     row.appendChild(inputRow);
     providerList.appendChild(row);
   });
+}
+
+function renderUsage(usage) {
+  if (!usage || !usage.length) {
+    usageSummary.innerHTML = '';
+    return;
+  }
+  const spent = usage.filter((u) => u.inTok + u.outTok > 0);
+  if (!spent.length) {
+    usageSummary.textContent = 'No usage yet today.';
+    return;
+  }
+  usageSummary.textContent =
+    'Today (est.): ' +
+    spent.map((u) => `${PROVIDER_META[u.provider]?.label.split(' ')[0] || u.provider} $${u.costUSD.toFixed(3)}`).join(' · ');
+}
+
+const BADGE_META = {
+  photo: { label: 'Photo Fan', emoji: '🖼️' },
+  document: { label: 'Bookworm', emoji: '📄' },
+  pdf: { label: 'Paper Trail', emoji: '📑' },
+  video: { label: 'Movie Buff', emoji: '🎬' },
+  audio: { label: 'Music Lover', emoji: '🎵' },
+  code: { label: 'Code Buddy', emoji: '💻' },
+  archive: { label: 'Treasure Hunter', emoji: '🗜️' },
+  other: { label: 'Curious Eater', emoji: '🍽️' }
+};
+
+function renderBadges(badges) {
+  badgeRow.innerHTML = '';
+  (badges || []).forEach((kind) => {
+    const meta = BADGE_META[kind] || BADGE_META.other;
+    const span = document.createElement('span');
+    span.className = 'badgeChip';
+    span.title = meta.label;
+    span.textContent = `${meta.emoji} ${meta.label}`;
+    badgeRow.appendChild(span);
+  });
+}
+
+function renderMemories(memories) {
+  memoryList.innerHTML = '';
+  if (!memories || !memories.length) {
+    memoryList.textContent = 'Nothing remembered yet — mention something worth keeping in mind and Buddy will save it.';
+    return;
+  }
+  memories
+    .slice()
+    .reverse()
+    .forEach((m) => {
+      const div = document.createElement('div');
+      div.className = 'memoryItem';
+      div.textContent = m.text;
+      memoryList.appendChild(div);
+    });
 }
 
 function renderVoice(enabled) {
@@ -154,6 +216,9 @@ async function init() {
   renderVoice(voiceEnabled);
   renderPicker();
   renderProviderList();
+  renderUsage(initState.usage);
+  renderBadges(initState.badges);
+  renderMemories(initState.memories);
   petNameLabel.textContent = initState.petName;
   petNameInput.value = initState.petName;
   welcomeRow.classList.toggle('hidden', !!initState.userName);
@@ -194,6 +259,7 @@ async function sendCurrentText() {
     }
     appendLog('assistant', result.reply);
     renderMood(result.mood);
+    renderUsage(result.usage);
   } else if (result.error === 'NO_API_KEY') {
     hasApiKey = false;
     settingsPanel.classList.remove('hidden');
@@ -215,6 +281,16 @@ settingsBtn.addEventListener('click', () => {
 
 showKeyRowBtn.addEventListener('click', () => {
   keyRow.classList.toggle('hidden');
+});
+
+showMemoryRowBtn.addEventListener('click', () => {
+  memoryRow.classList.toggle('hidden');
+});
+
+clearMemoryBtn.addEventListener('click', async () => {
+  await window.buddy.clearMemories();
+  renderMemories([]);
+  appendLog('assistant', "Okay, I've cleared everything I remembered about you.");
 });
 
 saveUserNameBtn.addEventListener('click', async () => {

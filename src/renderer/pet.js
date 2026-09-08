@@ -1,7 +1,9 @@
 const bubble = document.getElementById('bubble');
 const zzz = document.getElementById('zzz');
+const dropHint = document.getElementById('dropHint');
 const petFlip = document.getElementById('petFlip');
 const stage = document.getElementById('stage');
+const appEl = document.getElementById('app');
 
 let currentCharacter = 'robot';
 let currentMoodLabel = 'content';
@@ -215,6 +217,27 @@ window.addEventListener('mouseup', () => {
     }
   }
   dragState = null;
+});
+
+// --- Drag a file onto Buddy to feed it ---
+appEl.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  dropHint.classList.remove('hidden');
+});
+appEl.addEventListener('dragleave', () => {
+  dropHint.classList.add('hidden');
+});
+appEl.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  dropHint.classList.add('hidden');
+  const file = e.dataTransfer.files[0];
+  if (!file) return;
+  const filePath = window.buddy.getPathForFile(file);
+  if (!filePath) return;
+  window.buddy.notifyUserActive();
+  popHeart();
+  const result = await window.buddy.feedFile(filePath);
+  if (!result.ok && result.error) showBubble(result.error, 4000, { voice: false });
 });
 
 init();
