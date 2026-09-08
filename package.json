@@ -4,6 +4,11 @@
   "description": "A Clippy-style always-on desktop AI companion",
   "main": "src/main.js",
   "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gjurevskid/buddy.git"
+  },
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder"
